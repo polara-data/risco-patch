@@ -1,0 +1,11 @@
+{
+  "domain": "risco_patch",
+  "name": "Risco Patch (workaround pyrisco utf-8 / FAILED_UNLOAD / 0x17)",
+  "version": "1.0.0",
+  "documentation": "https://github.com/home-assistant/core/pull/165924",
+  "iot_class": "local_push",
+  "requirements": [],
+  "dependencies": [],
+  "codeowners": [],
+  "config_flow": false
+}
