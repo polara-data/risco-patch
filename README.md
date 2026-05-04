@@ -1,16 +1,17 @@
 # risco_patch
 
-A tiny Home Assistant custom component that **monkey-patches pyrisco at runtime** to fix three known bugs in the official **Risco Local** integration, plus a configuration recommendation that stops the panel-side TCP reset cycle.
+A tiny Home Assistant custom component that **monkey-patches pyrisco at runtime** to fix three known bugs in the official **Risco Local** integration.
+
 The official integration ships pyrisco `0.6.8`, where these bugs are unresolved as of HA `2026.4.x`.
 
-> **Audience.** You only need this if your Risco panel keeps reconnecting / your panel beeps every ~20-30 minutes / your config entry ends up in `FAILED_UNLOAD` after a few hours. Most common on **Italian / EU LightSYS / Agility / ProSYS** panels.
+> **Status (2026-05-04).** The 3 patches eliminate the integration-side crashes (UTF-8, FAILED_UNLOAD, 0x17 ValueError). They do NOT eliminate the panel "supervision lost" beep that some users (incl. me) are experiencing every ~20 minutes since a recent regression — see the [open question](#open-question--recent-regression-please-help) section.
 
 ---
 
 ## What the patch fixes (3 code patches)
 
 ### 1. `UnicodeDecodeError: 'utf-8' codec can't decode byte 0xa7`
-`pyrisco` hardcodes UTF-8 when decoding panel responses. Italian (and other latin-1 / cp1252) panels routinely send bytes in `0x80–0xFF`. Each invalid byte raises `UnicodeDecodeError`, killing the listener task. The integration reconnects, the panel sees back-to-back disconnect/connects and **emits a "supervision lost" beep**.
+`pyrisco` hardcodes UTF-8 when decoding panel responses. Italian (and other latin-1 / cp1252) panels routinely send bytes in `0x80–0xFF`. Each invalid byte raises `UnicodeDecodeError`, killing the listener task.
 
 **Patch:** default `encoding="latin-1"` on `RiscoSocket.__init__` (latin-1 maps every byte 0x00-0xFF, never raises). Plus `errors="replace"` on the actual decode call as a belt-and-braces safety net.
 
@@ -20,27 +21,33 @@ The official integration ships pyrisco `0.6.8`, where these bugs are unresolved 
 **Patch:** wrap `RiscoSocket.disconnect` in `try/except (ConnectionResetError, OSError, BrokenPipeError)` and call `_close()` for cleanup. Same intent as upstream PR [`home-assistant/core#165924`](https://github.com/home-assistant/core/pull/165924) (open, approved by @OnFreund, awaiting merge as of 2026-05).
 
 ### 3. `ValueError: too many values to unpack (expected 2, got 3)` in `RiscoCrypt.decode`
-`decode()` does `command, crc = decrypted.split('\x17')` assuming exactly one `0x17` (ETB) byte in the message. If the payload happens to contain another `0x17` (e.g. extended character set output, or certain firmware status messages), the split returns 3 parts and crashes the listener.
+`decode()` does `command, crc = decrypted.split('\x17')` assuming exactly one `0x17` (ETB) byte in the message. If the payload contains another `0x17`, the split returns 3 parts and crashes the listener.
 
 **Patch:** use `rfind('\x17')` so the **last** `0x17` is treated as the separator; tolerate empty / malformed messages by returning a "bad CRC" tuple instead of raising.
 
 ---
 
-## ⚙️ REQUIRED — also raise `scan_interval` to 600 seconds
+## Open question — recent regression, please help
 
-This is **not a patch but a required config change** that complements the three patches above.
+In my own setup (HA OS `2026.4.4`, pyrisco `0.6.8`, Risco LightSYS Plus IT firmware), with the 3 patches above applied **and the integration otherwise stable**, the panel still emits a "supervision lost" beep every **~20 minutes**, triggered by an unsolicited TCP RST from the panel.
 
-In our testing (LightSYS Plus IT firmware, HA Core 2026.4.4), the panel **TCP-resets the connection every ~23 minutes** when the integration's default `scan_interval=30s` is used. Each reset triggers the panel's supervision beep. Even with the three patches above the residual beep persists.
+**Crucially**: this **was NOT happening a few weeks ago** with the same panel and the same network. The integration was rock-solid for months. Something changed recently — and it's not pyrisco itself (`0.6.7` → `0.6.8` only changed cloud `User-Agent`, the local socket code is byte-identical).
 
-After raising `scan_interval` to **600 seconds (10 minutes)** we observed **60+ minutes of continuous uptime** with zero resets — confirming the cycle was polling-induced, not a firmware timer.
+If you have **any** of the following info, please open an issue / reply on the [HA forum thread](https://community.home-assistant.io/t/risco-local-custom-component-to-fix-utf-8-failed-unload-0x17-split-bugs-and-an-open-question-on-a-recent-regression/1009293) — it would help nail the root cause:
 
-**To change it:**
+- Same panel model + same firmware: are you also seeing the ~20-min RST/beep cycle now, even though it was fine weeks ago?
+- Did your panel receive a firmware OTA update recently?
+- Any HA core release in the last few weeks that changed the Risco integration's poll interval / keep-alive / connection lifecycle?
+- pyrisco DEBUG logs showing the last few RX/TX commands before the panel sends the RST.
 
-1. **Settings → Devices & services → Risco → Configure**.
-2. Set **Scan interval (sec)** to `600` (or higher).
-3. Save.
+Things I've already ruled out: `scan_interval` (tried 30s, 60s, 600s), `keepalive` interval (5s vs 60s) — the RST timing is identical regardless. So it's **not poll-induced**; the panel itself is closing the connection.
 
-Real-time push events from the panel (zone activation, arm/disarm) are **not** affected by `scan_interval`; only the periodic poll-style refresh of capabilities. So raising it has no functional downside.
+**Workarounds that mask but don't fix this** (and that I'm explicitly NOT shipping in this repo):
+
+- A 15-min "preemptive reconnect" automation that reloads the config entry before the panel times out. Hides the beep but causes 1-3 min of `setup_in_progress` per cycle and assumes the timeout is fixed (it might not be).
+- Bumping `scan_interval` to a high value. Doesn't actually change the RST timing.
+
+If/when the real cause is found, I'll update this repo and the forum post.
 
 ---
 
@@ -48,7 +55,7 @@ Real-time push events from the panel (zone activation, arm/disarm) are **not** a
 
 ### Option A — Manual
 
-1. Copy the `custom_components/risco_patch/` directory of this repo into `<config>/custom_components/`. Final layout:
+1. Copy `custom_components/risco_patch/` into `<config>/custom_components/`. Final layout:
 
    ```
    <config>/
@@ -75,49 +82,33 @@ Real-time push events from the panel (zone activation, arm/disarm) are **not** a
    [risco_patch] RiscoCrypt.decode patched (rsplit + errors=replace)
    ```
 
-5. **Don't forget step ⚙️ above**: raise `scan_interval` to 600 in Risco's options.
-
 ### Option B — HACS custom repository
-
-If you use HACS:
 
 1. HACS → ⋮ → **Custom repositories** → add this repo URL, category **Integration**.
 2. Search "Risco Patch", install.
 3. Add `risco_patch:` to `configuration.yaml`.
 4. Restart HA.
-5. Set Risco's `scan_interval` to 600 (see ⚙️ section above).
 
 ---
 
 ## How to verify it actually worked
 
-Within ~5 minutes of the restart you should see:
-
-| Before | After |
+| Before | After (with this patch) |
 |---|---|
 | Repeated `UnicodeDecodeError: 'utf-8' codec can't decode byte 0xa7…` in the log | Gone |
 | Risco config entry occasionally lands in `failed_unload`, requires HA restart | Stable `loaded` state |
-| Panel beeping every ~20-30 min | Gone (provided `scan_interval` è also raised) |
-
-Quick check from the Developer Tools → Template tab:
-
-```yaml
-{{ states('alarm_control_panel.<your_partition>') }}
-```
-
-Should return `disarmed` / `armed_*` and update in real time when you arm from the keypad.
+| `ValueError: too many values to unpack` in `RiscoCrypt.decode` | Gone |
+| Panel beep every ~20 min from supervision lost | **Still present — root cause not yet identified, see [open question](#open-question--recent-regression-please-help)** |
 
 ---
 
 ## How to remove
 
-When upstream PR [#165924](https://github.com/home-assistant/core/pull/165924) lands and (hopefully) when pyrisco exposes an `encoding` option:
-
 1. Remove `risco_patch:` from `configuration.yaml`.
 2. Delete `<config>/custom_components/risco_patch/`.
 3. Restart HA.
 
-The patch leaves no persistent state. Risco will go back to using stock pyrisco. You can also lower `scan_interval` back to 30 if the upstream patch addresses the panel reset.
+The patch leaves no persistent state.
 
 ---
 
@@ -125,10 +116,8 @@ The patch leaves no persistent state. Risco will go back to using stock pyrisco.
 
 - Tested on: HA Core `2026.4.4` (Home Assistant Green), pyrisco `0.6.8`, panel Risco LightSYS Plus (Italy).
 - Patches are written defensively and idempotent — they check a marker attribute before reapplying.
-- The `latin-1` default is **only applied if the caller doesn't specify `encoding`**. If a future HA version starts passing `encoding="utf-8"` explicitly, this patch becomes a no-op (and you should uninstall it anyway).
-- If your panel firmware speaks pure ASCII (most US installations), this patch is harmless but unnecessary.
-- If your panel actually **needs** UTF-8 (e.g. zone labels with emoji), you can change `_DEFAULT_ENCODING` at the top of `__init__.py` to `"utf-8"` and only Patch 2 + 3 will apply.
-- The `scan_interval=600` recommendation eliminated il ~23-min reset cycle on our LightSYS Plus. Other panel models / firmwares may have a different optimal value — try 300 or 900 if 600 doesn't help.
+- The `latin-1` default is **only applied if the caller doesn't specify `encoding`**. If a future HA version starts passing `encoding="utf-8"` explicitly, this patch becomes a no-op for Patch 1.
+- If your panel firmware speaks pure ASCII (most US installations), the encoding patch is harmless but unnecessary.
 
 ---
 
@@ -148,6 +137,7 @@ A custom_component:
 - Upstream resilience PR: <https://github.com/home-assistant/core/pull/165924>
 - pyrisco repo: <https://github.com/OnFreund/pyrisco>
 - HA Risco integration docs: <https://www.home-assistant.io/integrations/risco>
+- HA forum discussion: <https://community.home-assistant.io/t/risco-local-custom-component-to-fix-utf-8-failed-unload-0x17-split-bugs-and-an-open-question-on-a-recent-regression/1009293>
 
 ---
 
